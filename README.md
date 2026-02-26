@@ -1,6 +1,7 @@
 # QA Analysis for Janus/DT5202 Runs
 
 This repository contains a reproducible QA workflow for Janus ASCII list data with companion run metadata and service-monitoring logs.
+The pipeline auto-detects acquisition mode from metadata/list headers and selects the plot profile accordingly.
 
 The current commit includes `Run7` data and generated outputs:
 
@@ -10,11 +11,12 @@ The current commit includes `Run7` data and generated outputs:
 
 ## What the pipeline produces
 
-- Per-channel ADC distributions (HG) with estimated MIP peak overlays
-- Derived MIP peak position per channel
+- Per-channel ADC distributions for both HG and LG with estimated MIP peak overlays
+- Derived MIP peak position per channel (HG + LG)
 - Run-level rate time series in:
   - UTC
   - America/Los_Angeles
+  - with statistical uncertainties (Poisson error bars/bands)
 - Service-monitoring trends (temperatures, Vmon, Imon)
 - QA tables (`CSV` + `JSON`) and a lightweight HTML dashboard
 
@@ -49,6 +51,7 @@ From `Run7_Info.txt` and list-file header:
 - Gain select: `BOTH` (`HG_Gain=25`, `LG_Gain=55`)
 - Common pedestal setting: `100`
 - HV bias: `57 V`
+- List file format version: `3.3`
 
 ## QA summary (generated from Run7)
 
@@ -60,24 +63,32 @@ From `outputs/tables/summary_metrics.json`:
 - Event-span duration: `11,946.30 s`
 - Average trigger rate: `1.895 Hz`
 - Average integrated channel rate: `121.31 Hz`
-- Channels with MIP-peak estimate: `18`
-- Mean estimated MIP peak (across valid channels): `401.42 ADC`
+- Detected mode: `SPECTROSCOPY`
+- Gain select: `BOTH`
+- HG channels with MIP-peak estimate: `18`
+- LG channels with MIP-peak estimate: `18`
+- Mean estimated MIP peak (HG): `401.424 ADC`
+- Mean estimated MIP peak (LG): `559.876 ADC`
 
 ## Plots
 
-### HG ADC per channel (with estimated MIP peak marker)
+### HG ADC per channel (with estimated MIP peak marker + run timestamp labels)
 
 ![HG ADC by channel](outputs/plots/adc_hg_by_channel.png)
 
-### Derived MIP peak position per channel
+### LG ADC per channel (with estimated MIP peak marker + run timestamp labels)
 
-![MIP peak by channel](outputs/plots/mip_peak_by_channel.png)
+![LG ADC by channel](outputs/plots/adc_lg_by_channel.png)
 
-### Overall rate time series (UTC)
+### Derived MIP peak position per channel (HG + LG)
+
+![MIP peak by channel](outputs/plots/mip_peak_by_channel_hg_lg.png)
+
+### Overall rate time series (UTC, with statistical uncertainty)
 
 ![Rate UTC](outputs/plots/rate_timeseries_utc.png)
 
-### Overall rate time series (America/Los_Angeles)
+### Overall rate time series (America/Los_Angeles, with statistical uncertainty)
 
 ![Rate Los Angeles](outputs/plots/rate_timeseries_los_angeles.png)
 
@@ -92,4 +103,3 @@ From `outputs/tables/summary_metrics.json`:
 - Rate series: `outputs/tables/rate_timeseries.csv`
 - Parsed metadata: `outputs/tables/run_metadata.json`
 - Summary metrics: `outputs/tables/summary_metrics.json`
-

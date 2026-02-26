@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -22,6 +23,9 @@ class ListData:
     event_t_us: np.ndarray
     event_trg_id: np.ndarray
     event_nhits: np.ndarray
+    acquisition_mode_header: str | None
+    file_format_version: str | None
+    board_model: str | None
 
 
 RUN_START_RE = re.compile(r"Run start time:\s*(.+?)\s*UTC")
@@ -29,7 +33,38 @@ RUN_NUM_RE = re.compile(r"Run n\.\s*(\d+)")
 START_TIME_RE = re.compile(r"Start Time:\s*(\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}:\d{2})")
 STOP_TIME_RE = re.compile(r"Stop Time:\s*(\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}:\d{2})")
 ELAPSED_RE = re.compile(r"Elapsed time\s*=\s*([\d.]+)\s*s")
-KV_RE = re.compile(r"^([A-Za-z0-9_\[\]]+)\s+(.+?)\s*(?:#.*)?$")
+SOFTWARE_RE = re.compile(r"Software Version:\s*(.+)")
+OUTPUT_FORMAT_RE = re.compile(r"Output data format version:\s*(.+)")
+KV_RE = re.compile(r"^([A-Za-z0-9_\[\]]+)\s{2,}(.+?)\s*$")
+
+LIST_MODE_RE = re.compile(r"Acquisition Mode:\s*(.+)")
+LIST_FORMAT_RE = re.compile(r"File Format Version\s+(.+)")
+LIST_BOARD_RE = re.compile(r"Board:\s*(.+)")
+
+SUPPORTED_MODES = {"SPECTROSCOPY"}
+
+
+def round_float(value: float, digits: int = 3) -> float:
+    return float(round(float(value), digits))
+
+
+def standardize_mode(raw_mode: str | None) -> str | None:
+    if raw_mode is None:
+        return None
+    normalized = raw_mode.strip().upper().replace("-", "_")
+    if normalized in {"SPECTROSCOPY", "SPECT"}:
+        return "SPECTROSCOPY"
+    if normalized in {"SPECT_TIMING", "SPECTTIMING"}:
+        return "SPECT_TIMING"
+    if normalized in {"TIMING_CSTART", "TIMING_START"}:
+        return "TIMING_CSTART"
+    if normalized in {"TIMING_CSTOP", "TIMING_STOP"}:
+        return "TIMING_CSTOP"
+    if normalized == "COUNTING":
+        return "COUNTING"
+    if normalized == "WAVEFORM":
+        return "WAVEFORM"
+    return normalized
 
 
 def parse_run_info(info_path: Path) -> dict[str, Any]:
@@ -52,13 +87,22 @@ def parse_run_info(info_path: Path) -> dict[str, Any]:
     if elapsed_match:
         metadata["elapsed_seconds_reported"] = float(elapsed_match.group(1))
 
+    software_match = SOFTWARE_RE.search(text)
+    if software_match:
+        metadata["software_version"] = software_match.group(1).strip()
+
+    output_fmt_match = OUTPUT_FORMAT_RE.search(text)
+    if output_fmt_match:
+        metadata["output_data_format_version"] = output_fmt_match.group(1).strip()
+
     for line in text.splitlines():
         line = line.strip()
         if not line or line.startswith("#") or line.startswith("*"):
             continue
-        if ":" in line:
+        payload = line.split("#", 1)[0].rstrip()
+        if not payload:
             continue
-        match = KV_RE.match(line)
+        match = KV_RE.match(payload)
         if not match:
             continue
         key, raw_value = match.groups()
@@ -75,6 +119,9 @@ def parse_list_file(list_path: Path) -> ListData:
     event_nhits: list[int] = []
 
     run_start_utc: datetime | None = None
+    acquisition_mode_header: str | None = None
+    file_format_version: str | None = None
+    board_model: str | None = None
 
     with list_path.open("r", encoding="utf-8", errors="ignore") as handle:
         for line in handle:
@@ -88,6 +135,18 @@ def parse_list_file(list_path: Path) -> ListData:
                     run_start_utc = datetime.strptime(
                         start_match.group(1), "%a %b %d %H:%M:%S %Y"
                     ).replace(tzinfo=timezone.utc)
+
+                mode_match = LIST_MODE_RE.search(stripped)
+                if mode_match:
+                    acquisition_mode_header = standardize_mode(mode_match.group(1))
+
+                fmt_match = LIST_FORMAT_RE.search(stripped)
+                if fmt_match:
+                    file_format_version = fmt_match.group(1).strip()
+
+                board_match = LIST_BOARD_RE.search(stripped)
+                if board_match:
+                    board_model = board_match.group(1).strip()
                 continue
 
             if stripped.startswith("Brd"):
@@ -126,6 +185,9 @@ def parse_list_file(list_path: Path) -> ListData:
         event_t_us=np.asarray(event_t_us, dtype=np.float64),
         event_trg_id=np.asarray(event_trg_id, dtype=np.int32),
         event_nhits=np.asarray(event_nhits, dtype=np.int16),
+        acquisition_mode_header=acquisition_mode_header,
+        file_format_version=file_format_version,
+        board_model=board_model,
     )
 
 
@@ -135,7 +197,56 @@ def parse_service_info(service_path: Path) -> pd.DataFrame:
     return service_df
 
 
-def estimate_mip_peak(adc_values: np.ndarray) -> tuple[float, float, float]:
+def detect_mode_and_plot_profile(metadata: dict[str, Any], list_data: ListData) -> dict[str, Any]:
+    config_mode = standardize_mode(metadata.get("config", {}).get("AcquisitionMode"))
+    list_mode = standardize_mode(list_data.acquisition_mode_header)
+    detected_mode = config_mode or list_mode or "UNKNOWN"
+
+    mode_warnings: list[str] = []
+    if config_mode and list_mode and config_mode != list_mode:
+        mode_warnings.append(
+            f"Metadata/list mismatch: config mode={config_mode}, list header mode={list_mode}. Using {detected_mode}."
+        )
+
+    gain_select = metadata.get("config", {}).get("GainSelect", "BOTH").strip().upper()
+    has_hg = gain_select in {"BOTH", "HIGH", "AUTO"}
+    has_lg = gain_select in {"BOTH", "LOW"}
+    if gain_select not in {"BOTH", "HIGH", "LOW", "AUTO"}:
+        mode_warnings.append(f"Unknown GainSelect={gain_select}; defaulting to BOTH behavior.")
+        has_hg = True
+        has_lg = True
+
+    expected_plots: list[str] = [
+        "rate_timeseries_utc",
+        "rate_timeseries_los_angeles",
+        "service_monitoring_utc",
+    ]
+
+    if detected_mode == "SPECTROSCOPY":
+        if has_hg:
+            expected_plots.append("adc_hg_by_channel")
+        if has_lg:
+            expected_plots.append("adc_lg_by_channel")
+        expected_plots.append("mip_peak_by_channel_hg_lg")
+    else:
+        mode_warnings.append(
+            f"Mode {detected_mode} is not yet fully implemented; only generic rate/service plots will be generated."
+        )
+
+    return {
+        "detected_mode": detected_mode,
+        "mode_supported": detected_mode in SUPPORTED_MODES,
+        "gain_select": gain_select,
+        "expect_hg": has_hg,
+        "expect_lg": has_lg,
+        "expected_plots": expected_plots,
+        "warnings": mode_warnings,
+    }
+
+
+def estimate_mip_peak(
+    adc_values: np.ndarray, *, min_signal_offset: float = 40.0, abs_floor: float = 150.0
+) -> tuple[float, float, float]:
     values = adc_values.astype(np.float64)
     if values.size < 100:
         return math.nan, math.nan, math.nan
@@ -143,7 +254,7 @@ def estimate_mip_peak(adc_values: np.ndarray) -> tuple[float, float, float]:
     pedestal = float(np.median(values))
     mad = float(np.median(np.abs(values - pedestal)))
     sigma_est = 1.4826 * mad if mad > 0 else float(np.std(values))
-    threshold = max(pedestal + 5.0 * sigma_est, pedestal + 40.0, 150.0)
+    threshold = max(pedestal + 5.0 * sigma_est, pedestal + min_signal_offset, abs_floor)
 
     signal = values[values >= threshold]
     if signal.size < 30:
@@ -167,7 +278,12 @@ def build_channel_metrics(list_data: ListData) -> pd.DataFrame:
     for channel in range(64):
         hg = list_data.channel_hg[channel].astype(np.float64)
         lg = list_data.channel_lg[channel].astype(np.float64)
-        pedestal, threshold, mip_peak = estimate_mip_peak(hg)
+        hg_pedestal, hg_threshold, hg_mip_peak = estimate_mip_peak(
+            hg, min_signal_offset=40.0, abs_floor=150.0
+        )
+        lg_pedestal, lg_threshold, lg_mip_peak = estimate_mip_peak(
+            lg, min_signal_offset=30.0, abs_floor=120.0
+        )
 
         records.append(
             {
@@ -180,13 +296,21 @@ def build_channel_metrics(list_data: ListData) -> pd.DataFrame:
                 "hg_p95": float(np.percentile(hg, 95)) if hg.size else math.nan,
                 "lg_mean": float(np.mean(lg)) if lg.size else math.nan,
                 "lg_median": float(np.median(lg)) if lg.size else math.nan,
-                "mip_pedestal_hg": pedestal,
-                "mip_threshold_hg": threshold,
-                "mip_peak_hg": mip_peak,
+                "lg_std": float(np.std(lg)) if lg.size else math.nan,
+                "lg_p95": float(np.percentile(lg, 95)) if lg.size else math.nan,
+                "mip_pedestal_hg": hg_pedestal,
+                "mip_threshold_hg": hg_threshold,
+                "mip_peak_hg": hg_mip_peak,
+                "mip_pedestal_lg": lg_pedestal,
+                "mip_threshold_lg": lg_threshold,
+                "mip_peak_lg": lg_mip_peak,
             }
         )
 
-    return pd.DataFrame.from_records(records).sort_values("channel").reset_index(drop=True)
+    metrics_df = pd.DataFrame.from_records(records).sort_values("channel").reset_index(drop=True)
+    float_cols = metrics_df.select_dtypes(include=["float64", "float32"]).columns
+    metrics_df[float_cols] = metrics_df[float_cols].round(3)
+    return metrics_df
 
 
 def build_rate_dataframe(
@@ -208,110 +332,231 @@ def build_rate_dataframe(
     )
     rate_df["trigger_rate_hz"] = rate_df["events"] / rate_bin_sec
     rate_df["integrated_hit_rate_hz"] = rate_df["integrated_hits"] / rate_bin_sec
+    rate_df["trigger_rate_sigma_hz"] = np.sqrt(rate_df["events"]) / rate_bin_sec
+    rate_df["integrated_hit_rate_sigma_hz"] = np.sqrt(rate_df["integrated_hits"]) / rate_bin_sec
     rate_df = rate_df.reset_index()
-    rate_df["timestamp_la"] = rate_df["timestamp_utc"].dt.tz_convert(tz_name)
+    rate_df["timestamp_local"] = rate_df["timestamp_utc"].dt.tz_convert(tz_name)
+
+    float_cols = rate_df.select_dtypes(include=["float64", "float32"]).columns
+    rate_df[float_cols] = rate_df[float_cols].round(4)
 
     return rate_df, event_df["timestamp_utc"].min(), event_df["timestamp_utc"].max()
 
 
+def configure_datetime_axis(ax: plt.Axes) -> None:
+    locator = mdates.AutoDateLocator(minticks=5, maxticks=10)
+    formatter = mdates.ConciseDateFormatter(locator)
+    ax.xaxis.set_major_locator(locator)
+    ax.xaxis.set_major_formatter(formatter)
+
+
+def build_run_time_labels(
+    metadata: dict[str, Any], run_start_evt: pd.Timestamp, run_stop_evt: pd.Timestamp, tz_name: str
+) -> dict[str, str]:
+    run_number = metadata.get("run_number", "N/A")
+    mode = metadata.get("detected_mode", "N/A")
+    utc_label = f"{run_start_evt:%Y-%m-%d %H:%M:%S} to {run_stop_evt:%Y-%m-%d %H:%M:%S} UTC"
+
+    local_start = run_start_evt.tz_convert(tz_name)
+    local_stop = run_stop_evt.tz_convert(tz_name)
+    local_label = f"{local_start:%Y-%m-%d %H:%M:%S} to {local_stop:%Y-%m-%d %H:%M:%S} {tz_name}"
+
+    return {
+        "header": f"Run {run_number} | Mode {mode}",
+        "utc_window": utc_label,
+        "local_window": local_label,
+    }
+
+
 def plot_adc_histograms_by_channel(
-    channel_metrics: pd.DataFrame, list_data: ListData, output_path: Path
+    channel_data: dict[int, np.ndarray],
+    channel_metrics: pd.DataFrame,
+    gain_label: str,
+    output_path: Path,
+    run_labels: dict[str, str],
 ) -> None:
-    all_hg = np.concatenate([list_data.channel_hg[ch] for ch in range(64)])
-    x_max = float(np.percentile(all_hg, 99.8))
-    x_max = max(300.0, min(8192.0, x_max))
+    all_values = np.concatenate([channel_data[ch] for ch in range(64)])
+    x_max = float(np.percentile(all_values, 99.8))
+    x_max = max(220.0, min(8192.0, x_max))
 
-    fig, axes = plt.subplots(8, 8, figsize=(20, 18), constrained_layout=True, sharex=True, sharey=True)
-    bins = np.linspace(0, x_max, 80)
+    fig, axes = plt.subplots(8, 8, figsize=(22, 19), constrained_layout=True, sharex=True, sharey=True)
+    bins = np.linspace(0, x_max, 82)
 
-    mip_lookup = channel_metrics.set_index("channel")["mip_peak_hg"].to_dict()
+    peak_col = f"mip_peak_{gain_label.lower()}"
+    mip_lookup = channel_metrics.set_index("channel")[peak_col].to_dict()
+    hist_color = "#1f77b4" if gain_label.upper() == "HG" else "#2ca02c"
 
     for ch in range(64):
         ax = axes[ch // 8, ch % 8]
-        hg = list_data.channel_hg[ch]
-        ax.hist(hg, bins=bins, color="#1f77b4", alpha=0.8)
+        values = channel_data[ch]
+        ax.hist(values, bins=bins, color=hist_color, alpha=0.85, edgecolor="none")
         mip = mip_lookup.get(ch, math.nan)
         if not np.isnan(mip):
-            ax.axvline(mip, color="#d62728", lw=1.0)
+            ax.axvline(mip, color="#d62728", lw=1.2, alpha=0.95)
         ax.set_title(f"Ch {ch:02d}", fontsize=9)
         ax.tick_params(axis="both", labelsize=7)
 
-    fig.suptitle("HG ADC Distribution by Channel (red line: estimated MIP peak)", fontsize=15)
-    fig.supxlabel("HG ADC")
-    fig.supylabel("Counts")
-    fig.savefig(output_path, dpi=150)
+    fig.suptitle(
+        f"{gain_label.upper()} ADC Distribution by Channel (red = estimated MIP peak)\n"
+        f"{run_labels['header']} | {run_labels['utc_window']}",
+        fontsize=15,
+    )
+    fig.supxlabel(f"{gain_label.upper()} ADC", fontsize=12)
+    fig.supylabel("Counts", fontsize=12)
+    fig.text(0.5, 0.005, f"Local time window: {run_labels['local_window']}", ha="center", fontsize=10)
+    fig.savefig(output_path, dpi=160)
     plt.close(fig)
 
 
-def plot_mip_peaks(channel_metrics: pd.DataFrame, output_path: Path) -> None:
-    fig, ax = plt.subplots(figsize=(13, 5))
+def plot_mip_peaks(channel_metrics: pd.DataFrame, output_path: Path, run_labels: dict[str, str]) -> None:
+    fig, ax = plt.subplots(figsize=(13.5, 6.2))
     ax.plot(
         channel_metrics["channel"],
         channel_metrics["mip_peak_hg"],
         marker="o",
-        lw=1.2,
-        ms=4,
+        lw=2.0,
+        ms=4.5,
         color="#d62728",
-        label="Estimated MIP peak (HG)",
+        label="MIP peak HG",
+    )
+    ax.plot(
+        channel_metrics["channel"],
+        channel_metrics["mip_peak_lg"],
+        marker="s",
+        lw=2.0,
+        ms=4.0,
+        color="#2ca02c",
+        label="MIP peak LG",
     )
     ax.plot(
         channel_metrics["channel"],
         channel_metrics["mip_pedestal_hg"],
-        marker=".",
-        lw=1.0,
-        ms=6,
+        lw=1.5,
+        ls="--",
         color="#1f77b4",
-        label="Pedestal estimate (HG)",
+        alpha=0.85,
+        label="Pedestal HG",
     )
-    ax.set_xlabel("Channel")
-    ax.set_ylabel("ADC")
-    ax.set_title("Derived MIP Peak and Pedestal per Channel")
-    ax.grid(True, alpha=0.25)
-    ax.legend()
-    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    ax.plot(
+        channel_metrics["channel"],
+        channel_metrics["mip_pedestal_lg"],
+        lw=1.5,
+        ls="--",
+        color="#17becf",
+        alpha=0.85,
+        label="Pedestal LG",
+    )
+    ax.set_xlabel("Channel", fontsize=12)
+    ax.set_ylabel("ADC", fontsize=12)
+    ax.set_title("Derived MIP Peak and Pedestal per Channel", fontsize=14)
+    ax.grid(True, alpha=0.28)
+    ax.legend(loc="upper left", fontsize=10, ncol=2, framealpha=0.95)
+    ax.xaxis.set_major_locator(plt.MaxNLocator(integer=True, nbins=16))
+    ax.tick_params(labelsize=10)
+    ax.text(
+        0.01,
+        0.98,
+        f"{run_labels['header']}\nUTC: {run_labels['utc_window']}\nLocal: {run_labels['local_window']}",
+        transform=ax.transAxes,
+        va="top",
+        fontsize=9.3,
+        bbox={"boxstyle": "round,pad=0.3", "facecolor": "white", "alpha": 0.88, "edgecolor": "#cccccc"},
+    )
+    fig.savefig(output_path, dpi=170, bbox_inches="tight")
     plt.close(fig)
 
 
-def plot_rate_timeseries(rate_df: pd.DataFrame, output_utc: Path, output_la: Path) -> None:
-    fig1, ax1 = plt.subplots(figsize=(13, 5))
-    ax1.plot(rate_df["timestamp_utc"], rate_df["trigger_rate_hz"], color="#1f77b4", lw=1.2, label="Trigger rate [Hz]")
-    ax1.plot(
-        rate_df["timestamp_utc"],
-        rate_df["integrated_hit_rate_hz"],
-        color="#ff7f0e",
-        lw=1.1,
-        label="Integrated channel rate [Hz]",
+def plot_rate_single_axis(
+    ax: plt.Axes,
+    x_values: pd.Series,
+    rate_df: pd.DataFrame,
+    x_label: str,
+    run_labels: dict[str, str],
+    zone_label: str,
+) -> None:
+    trig = rate_df["trigger_rate_hz"].to_numpy(dtype=float)
+    trig_sigma = rate_df["trigger_rate_sigma_hz"].to_numpy(dtype=float)
+    hit = rate_df["integrated_hit_rate_hz"].to_numpy(dtype=float)
+    hit_sigma = rate_df["integrated_hit_rate_sigma_hz"].to_numpy(dtype=float)
+
+    ax.plot(x_values, trig, color="#1f77b4", lw=2.1, label="Trigger rate [Hz]")
+    ax.plot(x_values, hit, color="#ff7f0e", lw=2.1, label="Integrated channel rate [Hz]")
+
+    ax.fill_between(x_values, trig - trig_sigma, trig + trig_sigma, color="#1f77b4", alpha=0.12)
+    ax.fill_between(x_values, hit - hit_sigma, hit + hit_sigma, color="#ff7f0e", alpha=0.11)
+
+    step = max(1, len(rate_df) // 80)
+    reduced = rate_df.iloc[::step]
+    reduced_x = x_values.iloc[::step]
+    ax.errorbar(
+        reduced_x,
+        reduced["trigger_rate_hz"],
+        yerr=reduced["trigger_rate_sigma_hz"],
+        fmt="none",
+        ecolor="#1f77b4",
+        alpha=0.35,
+        elinewidth=0.9,
+        capsize=1.8,
     )
-    ax1.set_title("Run Rate Time Series (UTC)")
-    ax1.set_xlabel("Time (UTC)")
-    ax1.set_ylabel("Rate [Hz]")
-    ax1.grid(True, alpha=0.25)
-    ax1.legend()
-    fig1.autofmt_xdate()
-    fig1.savefig(output_utc, dpi=150, bbox_inches="tight")
+    ax.errorbar(
+        reduced_x,
+        reduced["integrated_hit_rate_hz"],
+        yerr=reduced["integrated_hit_rate_sigma_hz"],
+        fmt="none",
+        ecolor="#ff7f0e",
+        alpha=0.35,
+        elinewidth=0.9,
+        capsize=1.8,
+    )
+
+    ax.set_title(f"Run Rate Time Series ({zone_label})", fontsize=14)
+    ax.set_xlabel(x_label, fontsize=11)
+    ax.set_ylabel("Rate [Hz]", fontsize=11)
+    ax.grid(True, alpha=0.26)
+    ax.legend(loc="upper left", fontsize=10, framealpha=0.95)
+    configure_datetime_axis(ax)
+    ax.text(
+        0.99,
+        0.98,
+        f"{run_labels['header']}\nUTC: {run_labels['utc_window']}",
+        transform=ax.transAxes,
+        ha="right",
+        va="top",
+        fontsize=9.2,
+        bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "alpha": 0.86, "edgecolor": "#cccccc"},
+    )
+
+
+def plot_rate_timeseries(
+    rate_df: pd.DataFrame, output_utc: Path, output_local: Path, run_labels: dict[str, str], tz_name: str
+) -> None:
+    fig1, ax1 = plt.subplots(figsize=(14, 5.8))
+    plot_rate_single_axis(
+        ax1,
+        rate_df["timestamp_utc"],
+        rate_df,
+        "Time (UTC)",
+        run_labels=run_labels,
+        zone_label="UTC",
+    )
+    fig1.savefig(output_utc, dpi=165, bbox_inches="tight")
     plt.close(fig1)
 
-    fig2, ax2 = plt.subplots(figsize=(13, 5))
-    ax2.plot(rate_df["timestamp_la"], rate_df["trigger_rate_hz"], color="#1f77b4", lw=1.2, label="Trigger rate [Hz]")
-    ax2.plot(
-        rate_df["timestamp_la"],
-        rate_df["integrated_hit_rate_hz"],
-        color="#ff7f0e",
-        lw=1.1,
-        label="Integrated channel rate [Hz]",
+    fig2, ax2 = plt.subplots(figsize=(14, 5.8))
+    plot_rate_single_axis(
+        ax2,
+        rate_df["timestamp_local"],
+        rate_df,
+        f"Time ({tz_name})",
+        run_labels=run_labels,
+        zone_label=tz_name,
     )
-    ax2.set_title("Run Rate Time Series (America/Los_Angeles)")
-    ax2.set_xlabel("Time (America/Los_Angeles)")
-    ax2.set_ylabel("Rate [Hz]")
-    ax2.grid(True, alpha=0.25)
-    ax2.legend()
-    fig2.autofmt_xdate()
-    fig2.savefig(output_la, dpi=150, bbox_inches="tight")
+    fig2.savefig(output_local, dpi=165, bbox_inches="tight")
     plt.close(fig2)
 
 
-def plot_service_info(service_df: pd.DataFrame, output_path: Path) -> None:
-    fig, axes = plt.subplots(2, 1, figsize=(13, 8), sharex=True, constrained_layout=True)
+def plot_service_info(service_df: pd.DataFrame, output_path: Path, run_labels: dict[str, str]) -> None:
+    fig, axes = plt.subplots(2, 1, figsize=(14, 8.6), sharex=True, constrained_layout=True)
 
     for column, color in [
         ("BrdTemp", "#1f77b4"),
@@ -319,21 +564,33 @@ def plot_service_info(service_df: pd.DataFrame, output_path: Path) -> None:
         ("FPGATemp", "#d62728"),
         ("HVTemp", "#9467bd"),
     ]:
-        axes[0].plot(service_df["timestamp_utc"], service_df[column], lw=1.0, label=column, color=color)
-    axes[0].set_title("Board Environment Metrics (UTC)")
-    axes[0].set_ylabel("Temperature [C]")
+        axes[0].plot(service_df["timestamp_utc"], service_df[column], lw=1.8, label=column, color=color)
+    axes[0].set_title("Board Environment Metrics (UTC)", fontsize=13)
+    axes[0].set_ylabel("Temperature [C]", fontsize=11)
     axes[0].grid(True, alpha=0.25)
-    axes[0].legend(ncol=4, fontsize=8)
+    axes[0].legend(loc="upper left", ncol=4, fontsize=9.5, framealpha=0.95)
 
-    axes[1].plot(service_df["timestamp_utc"], service_df["Vmon"], lw=1.1, label="Vmon [V]", color="#ff7f0e")
-    axes[1].plot(service_df["timestamp_utc"], service_df["Imon"], lw=1.1, label="Imon [mA]", color="#8c564b")
-    axes[1].set_title("HV Monitoring (UTC)")
-    axes[1].set_ylabel("Monitor Value")
-    axes[1].set_xlabel("Time (UTC)")
+    axes[1].plot(service_df["timestamp_utc"], service_df["Vmon"], lw=1.9, label="Vmon [V]", color="#ff7f0e")
+    axes[1].plot(service_df["timestamp_utc"], service_df["Imon"], lw=1.9, label="Imon [mA]", color="#8c564b")
+    axes[1].set_title("HV Monitoring (UTC)", fontsize=13)
+    axes[1].set_ylabel("Monitor Value", fontsize=11)
+    axes[1].set_xlabel("Time (UTC)", fontsize=11)
     axes[1].grid(True, alpha=0.25)
-    axes[1].legend(fontsize=9)
+    axes[1].legend(loc="upper left", fontsize=10, framealpha=0.95)
 
-    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    configure_datetime_axis(axes[1])
+    axes[0].text(
+        0.99,
+        0.97,
+        f"{run_labels['header']}\n{run_labels['utc_window']}",
+        transform=axes[0].transAxes,
+        ha="right",
+        va="top",
+        fontsize=9.1,
+        bbox={"boxstyle": "round,pad=0.22", "facecolor": "white", "alpha": 0.86, "edgecolor": "#cccccc"},
+    )
+
+    fig.savefig(output_path, dpi=165, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -347,6 +604,7 @@ def write_dashboard(
     rows = []
     for key in [
         "AcquisitionMode",
+        "GainSelect",
         "TriggerLogic",
         "HG_Gain",
         "LG_Gain",
@@ -357,10 +615,24 @@ def write_dashboard(
     ]:
         rows.append(f"<tr><td>{key}</td><td>{cfg.get(key, 'N/A')}</td></tr>")
 
-    summary_rows = "".join(
-        f"<tr><td>{k}</td><td>{v}</td></tr>" for k, v in summary_metrics.items() if k != "run_start_utc"
-    )
+    summary_rows = "".join(f"<tr><td>{k}</td><td>{v}</td></tr>" for k, v in summary_metrics.items())
     config_rows = "".join(rows)
+
+    display_order = [
+        ("adc_hg_by_channel", "ADC per Channel (HG)"),
+        ("adc_lg_by_channel", "ADC per Channel (LG)"),
+        ("mip_peak_by_channel_hg_lg", "Derived MIP Peaks (HG + LG)"),
+        ("rate_timeseries_utc", "Rate Time Series (UTC)"),
+        ("rate_timeseries_los_angeles", "Rate Time Series (America/Los_Angeles)"),
+        ("service_monitoring_utc", "Service Monitoring (UTC)"),
+    ]
+
+    sections = []
+    for key, title in display_order:
+        if key in plot_paths:
+            sections.append(
+                f"<section><h2>{title}</h2><img src=\"{plot_paths[key]}\" alt=\"{title}\"></section>"
+            )
 
     html = f"""<!doctype html>
 <html lang="en">
@@ -381,7 +653,7 @@ def write_dashboard(
 </head>
 <body>
   <h1>Run QA Dashboard</h1>
-  <p class="meta"><strong>Run:</strong> {metadata.get('run_number', 'N/A')} | <strong>UTC start:</strong> {summary_metrics.get('run_start_utc', 'N/A')}</p>
+  <p class="meta"><strong>Run:</strong> {metadata.get('run_number', 'N/A')} | <strong>Detected mode:</strong> {metadata.get('detected_mode', 'N/A')}</p>
 
   <h2>Summary Metrics</h2>
   <table>
@@ -394,26 +666,7 @@ def write_dashboard(
   </table>
 
   <div class="grid">
-    <section>
-      <h2>ADC per Channel (HG)</h2>
-      <img src="{plot_paths['adc_by_channel']}" alt="ADC by channel">
-    </section>
-    <section>
-      <h2>Derived MIP Peaks</h2>
-      <img src="{plot_paths['mip_peaks']}" alt="MIP peaks">
-    </section>
-    <section>
-      <h2>Rate Time Series (UTC)</h2>
-      <img src="{plot_paths['rate_utc']}" alt="Rate UTC">
-    </section>
-    <section>
-      <h2>Rate Time Series (America/Los_Angeles)</h2>
-      <img src="{plot_paths['rate_la']}" alt="Rate LA">
-    </section>
-    <section>
-      <h2>Service Monitoring</h2>
-      <img src="{plot_paths['service']}" alt="Service monitoring">
-    </section>
+    {"".join(sections)}
   </div>
 </body>
 </html>
@@ -425,6 +678,8 @@ def make_serializable(value: Any) -> Any:
     if isinstance(value, (np.integer,)):
         return int(value)
     if isinstance(value, (np.floating,)):
+        if math.isnan(float(value)) or math.isinf(float(value)):
+            return None
         return float(value)
     if isinstance(value, (pd.Timestamp, datetime)):
         return str(value)
@@ -434,7 +689,9 @@ def make_serializable(value: Any) -> Any:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Generate QA metrics, plots, and dashboard from Janus Run files.")
+    parser = argparse.ArgumentParser(
+        description="Generate QA metrics, plots, and dashboard from Janus run list/info/service files."
+    )
     parser.add_argument("--list-file", type=Path, default=Path("data/raw/Run7_list.txt"))
     parser.add_argument("--info-file", type=Path, default=Path("data/raw/Run7_Info.txt"))
     parser.add_argument("--service-file", type=Path, default=Path("data/raw/Run7_ServiceInfo.txt"))
@@ -442,6 +699,16 @@ def main() -> None:
     parser.add_argument("--timezone", type=str, default="America/Los_Angeles")
     parser.add_argument("--rate-bin-sec", type=int, default=60)
     args = parser.parse_args()
+
+    plt.rcParams.update(
+        {
+            "axes.titlesize": 13,
+            "axes.labelsize": 11,
+            "legend.fontsize": 10,
+            "xtick.labelsize": 10,
+            "ytick.labelsize": 10,
+        }
+    )
 
     plots_dir = args.outdir / "plots"
     tables_dir = args.outdir / "tables"
@@ -453,43 +720,98 @@ def main() -> None:
     metadata = parse_run_info(args.info_file)
     list_data = parse_list_file(args.list_file)
     service_df = parse_service_info(args.service_file)
+
+    mode_profile = detect_mode_and_plot_profile(metadata, list_data)
+    metadata["detected_mode"] = mode_profile["detected_mode"]
+    metadata["mode_profile"] = mode_profile
+    metadata["list_file_format_version"] = list_data.file_format_version
+    metadata["list_header_board"] = list_data.board_model
+
     channel_metrics = build_channel_metrics(list_data)
     rate_df, run_start_evt, run_stop_evt = build_rate_dataframe(list_data, args.rate_bin_sec, args.timezone)
+    run_labels = build_run_time_labels(metadata, run_start_evt, run_stop_evt, args.timezone)
 
-    plot_adc_histograms_by_channel(channel_metrics, list_data, plots_dir / "adc_hg_by_channel.png")
-    plot_mip_peaks(channel_metrics, plots_dir / "mip_peak_by_channel.png")
-    plot_rate_timeseries(
-        rate_df,
-        plots_dir / "rate_timeseries_utc.png",
-        plots_dir / "rate_timeseries_los_angeles.png",
-    )
-    plot_service_info(service_df, plots_dir / "service_monitoring_utc.png")
+    generated_plots: dict[str, str] = {}
+
+    if "adc_hg_by_channel" in mode_profile["expected_plots"]:
+        plot_adc_histograms_by_channel(
+            channel_data=list_data.channel_hg,
+            channel_metrics=channel_metrics,
+            gain_label="HG",
+            output_path=plots_dir / "adc_hg_by_channel.png",
+            run_labels=run_labels,
+        )
+        generated_plots["adc_hg_by_channel"] = "../plots/adc_hg_by_channel.png"
+
+    if "adc_lg_by_channel" in mode_profile["expected_plots"]:
+        plot_adc_histograms_by_channel(
+            channel_data=list_data.channel_lg,
+            channel_metrics=channel_metrics,
+            gain_label="LG",
+            output_path=plots_dir / "adc_lg_by_channel.png",
+            run_labels=run_labels,
+        )
+        generated_plots["adc_lg_by_channel"] = "../plots/adc_lg_by_channel.png"
+
+    if "mip_peak_by_channel_hg_lg" in mode_profile["expected_plots"]:
+        plot_mip_peaks(channel_metrics, plots_dir / "mip_peak_by_channel_hg_lg.png", run_labels)
+        generated_plots["mip_peak_by_channel_hg_lg"] = "../plots/mip_peak_by_channel_hg_lg.png"
+
+    if "rate_timeseries_utc" in mode_profile["expected_plots"] or "rate_timeseries_los_angeles" in mode_profile[
+        "expected_plots"
+    ]:
+        plot_rate_timeseries(
+            rate_df,
+            plots_dir / "rate_timeseries_utc.png",
+            plots_dir / "rate_timeseries_los_angeles.png",
+            run_labels=run_labels,
+            tz_name=args.timezone,
+        )
+        generated_plots["rate_timeseries_utc"] = "../plots/rate_timeseries_utc.png"
+        generated_plots["rate_timeseries_los_angeles"] = "../plots/rate_timeseries_los_angeles.png"
+
+    if "service_monitoring_utc" in mode_profile["expected_plots"]:
+        plot_service_info(service_df, plots_dir / "service_monitoring_utc.png", run_labels)
+        generated_plots["service_monitoring_utc"] = "../plots/service_monitoring_utc.png"
 
     channel_metrics.to_csv(tables_dir / "channel_metrics.csv", index=False)
     rate_df.to_csv(tables_dir / "rate_timeseries.csv", index=False)
     service_df.to_csv(tables_dir / "service_info_parsed.csv", index=False)
 
-    valid_mip = channel_metrics["mip_peak_hg"].dropna()
+    valid_mip_hg = channel_metrics["mip_peak_hg"].dropna()
+    valid_mip_lg = channel_metrics["mip_peak_lg"].dropna()
     run_duration_s = (run_stop_evt - run_start_evt).total_seconds()
     summary_metrics: dict[str, Any] = {
         "run_start_utc": list_data.run_start_utc.isoformat(),
         "run_start_event_utc": run_start_evt.isoformat(),
         "run_stop_event_utc": run_stop_evt.isoformat(),
+        "run_start_local": run_start_evt.tz_convert(args.timezone).isoformat(),
+        "run_stop_local": run_stop_evt.tz_convert(args.timezone).isoformat(),
+        "detected_mode": mode_profile["detected_mode"],
+        "gain_select": mode_profile["gain_select"],
+        "list_file_format_version": list_data.file_format_version,
         "events": int(list_data.event_t_us.size),
         "channels": 64,
         "total_samples": int(sum(arr.size for arr in list_data.channel_hg.values())),
-        "run_duration_s_from_events": float(run_duration_s),
-        "trigger_rate_hz_avg": float(list_data.event_t_us.size / run_duration_s) if run_duration_s > 0 else math.nan,
-        "integrated_hit_rate_hz_avg": float(np.sum(list_data.event_nhits) / run_duration_s) if run_duration_s > 0 else math.nan,
-        "mip_peak_channels_with_estimate": int(valid_mip.size),
-        "mip_peak_hg_mean_adc": float(valid_mip.mean()) if valid_mip.size else math.nan,
-        "mip_peak_hg_std_adc": float(valid_mip.std()) if valid_mip.size else math.nan,
-        "vmon_mean": float(service_df["Vmon"].mean()),
-        "imon_mean_ma": float(service_df["Imon"].mean()),
-        "board_temp_mean_c": float(service_df["BrdTemp"].mean()),
-        "det_temp_mean_c": float(service_df["DetTemp"].mean()),
-        "fpga_temp_mean_c": float(service_df["FPGATemp"].mean()),
-        "hv_temp_mean_c": float(service_df["HVTemp"].mean()),
+        "run_duration_s_from_events": round_float(run_duration_s, 3),
+        "trigger_rate_hz_avg": round_float(float(list_data.event_t_us.size / run_duration_s), 4)
+        if run_duration_s > 0
+        else math.nan,
+        "integrated_hit_rate_hz_avg": round_float(float(np.sum(list_data.event_nhits) / run_duration_s), 4)
+        if run_duration_s > 0
+        else math.nan,
+        "mip_peak_hg_channels_with_estimate": int(valid_mip_hg.size),
+        "mip_peak_hg_mean_adc": round_float(float(valid_mip_hg.mean()), 3) if valid_mip_hg.size else math.nan,
+        "mip_peak_hg_std_adc": round_float(float(valid_mip_hg.std()), 3) if valid_mip_hg.size else math.nan,
+        "mip_peak_lg_channels_with_estimate": int(valid_mip_lg.size),
+        "mip_peak_lg_mean_adc": round_float(float(valid_mip_lg.mean()), 3) if valid_mip_lg.size else math.nan,
+        "mip_peak_lg_std_adc": round_float(float(valid_mip_lg.std()), 3) if valid_mip_lg.size else math.nan,
+        "vmon_mean_v": round_float(float(service_df["Vmon"].mean()), 4),
+        "imon_mean_ma": round_float(float(service_df["Imon"].mean()), 5),
+        "board_temp_mean_c": round_float(float(service_df["BrdTemp"].mean()), 3),
+        "det_temp_mean_c": round_float(float(service_df["DetTemp"].mean()), 3),
+        "fpga_temp_mean_c": round_float(float(service_df["FPGATemp"].mean()), 3),
+        "hv_temp_mean_c": round_float(float(service_df["HVTemp"].mean()), 3),
     }
 
     (tables_dir / "run_metadata.json").write_text(
@@ -503,16 +825,13 @@ def main() -> None:
         dashboard_path=dashboard_dir / "index.html",
         summary_metrics={k: make_serializable(v) for k, v in summary_metrics.items()},
         metadata=metadata,
-        plot_paths={
-            "adc_by_channel": "../plots/adc_hg_by_channel.png",
-            "mip_peaks": "../plots/mip_peak_by_channel.png",
-            "rate_utc": "../plots/rate_timeseries_utc.png",
-            "rate_la": "../plots/rate_timeseries_los_angeles.png",
-            "service": "../plots/service_monitoring_utc.png",
-        },
+        plot_paths=generated_plots,
     )
 
     print("QA report generated.")
+    print(f"- Detected mode: {mode_profile['detected_mode']}")
+    if mode_profile["warnings"]:
+        print(f"- Warnings: {' | '.join(mode_profile['warnings'])}")
     print(f"- Dashboard: {dashboard_dir / 'index.html'}")
     print(f"- Summary metrics: {tables_dir / 'summary_metrics.json'}")
 
