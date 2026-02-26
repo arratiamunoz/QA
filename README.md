@@ -16,7 +16,8 @@ The current commit includes `Run7` data and generated outputs:
 - Run-level rate time series in:
   - UTC
   - America/Los_Angeles
-  - with statistical uncertainties (Poisson error bars/bands)
+  - trigger rate only, with statistical uncertainties (Poisson error bars/bands)
+- Channel threshold-pass summary (`ADC >= 200` by default) to identify possible dead channels
 - Service-monitoring trends (temperatures, Vmon, Imon)
 - QA tables (`CSV` + `JSON`) and a lightweight HTML dashboard
 
@@ -36,7 +37,8 @@ python src/generate_qa_report.py ^
   --service-file data/raw/Run7_ServiceInfo.txt ^
   --outdir outputs ^
   --timezone America/Los_Angeles ^
-  --rate-bin-sec 60
+  --rate-bin-sec 60 ^
+  --channel-threshold-adc 200
 ```
 
 ## Metadata snapshot (Run7)
@@ -62,13 +64,15 @@ From `outputs/tables/summary_metrics.json`:
 - Samples: `1,449,152` (64 samples/event)
 - Event-span duration: `11,946.30 s`
 - Average trigger rate: `1.895 Hz`
-- Average integrated channel rate: `121.31 Hz`
 - Detected mode: `SPECTROSCOPY`
 - Gain select: `BOTH`
+- Trigger logic / thresholds: `MAJ64`, `TD=450`, `QD=250`
+- Threshold-pass summary threshold: `200 ADC`
 - HG channels with MIP-peak estimate: `18`
 - LG channels with MIP-peak estimate: `18`
 - Mean estimated MIP peak (HG): `401.424 ADC`
 - Mean estimated MIP peak (LG): `559.876 ADC`
+- Channels with zero counts above 200 ADC: `HG=36`, `LG=46`
 
 ## Plots
 
@@ -84,11 +88,15 @@ From `outputs/tables/summary_metrics.json`:
 
 ![MIP peak by channel](outputs/plots/mip_peak_by_channel_hg_lg.png)
 
-### Overall rate time series (UTC, with statistical uncertainty)
+### Channel counts above threshold (dead-channel screening)
+
+![Channel threshold counts](outputs/plots/channel_threshold_counts.png)
+
+### Trigger rate time series (UTC, with statistical uncertainty)
 
 ![Rate UTC](outputs/plots/rate_timeseries_utc.png)
 
-### Overall rate time series (America/Los_Angeles, with statistical uncertainty)
+### Trigger rate time series (America/Los_Angeles, with statistical uncertainty)
 
 ![Rate Los Angeles](outputs/plots/rate_timeseries_los_angeles.png)
 
@@ -100,6 +108,7 @@ From `outputs/tables/summary_metrics.json`:
 
 - Dashboard: `outputs/dashboard/index.html`
 - Channel metrics: `outputs/tables/channel_metrics.csv`
+- Channel threshold summary: `outputs/tables/channel_threshold_summary.csv`
 - Rate series: `outputs/tables/rate_timeseries.csv`
 - Parsed metadata: `outputs/tables/run_metadata.json`
 - Summary metrics: `outputs/tables/summary_metrics.json`

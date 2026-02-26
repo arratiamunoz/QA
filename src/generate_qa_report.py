@@ -228,6 +228,7 @@ def detect_mode_and_plot_profile(metadata: dict[str, Any], list_data: ListData) 
         if has_lg:
             expected_plots.append("adc_lg_by_channel")
         expected_plots.append("mip_peak_by_channel_hg_lg")
+        expected_plots.append("channel_threshold_counts")
     else:
         mode_warnings.append(
             f"Mode {detected_mode} is not yet fully implemented; only generic rate/service plots will be generated."
@@ -328,12 +329,10 @@ def build_rate_dataframe(
     rate_df = (
         event_df.set_index("timestamp_utc")
         .resample(f"{rate_bin_sec}s")
-        .agg(events=("event_count", "sum"), integrated_hits=("nhits", "sum"))
+        .agg(events=("event_count", "sum"))
     )
     rate_df["trigger_rate_hz"] = rate_df["events"] / rate_bin_sec
-    rate_df["integrated_hit_rate_hz"] = rate_df["integrated_hits"] / rate_bin_sec
     rate_df["trigger_rate_sigma_hz"] = np.sqrt(rate_df["events"]) / rate_bin_sec
-    rate_df["integrated_hit_rate_sigma_hz"] = np.sqrt(rate_df["integrated_hits"]) / rate_bin_sec
     rate_df = rate_df.reset_index()
     rate_df["timestamp_local"] = rate_df["timestamp_utc"].dt.tz_convert(tz_name)
 
@@ -368,18 +367,57 @@ def build_run_time_labels(
     }
 
 
+def build_plot_context(metadata: dict[str, Any], channel_threshold_adc: int) -> dict[str, str]:
+    cfg = metadata.get("config", {})
+    trigger_logic = cfg.get("TriggerLogic", "N/A")
+    td_thr = cfg.get("TD_CoarseThreshold", "N/A")
+    qd_thr = cfg.get("QD_CoarseThreshold", "N/A")
+    return {
+        "trigger_logic": str(trigger_logic),
+        "td_threshold": str(td_thr),
+        "qd_threshold": str(qd_thr),
+        "channel_threshold_adc": str(channel_threshold_adc),
+    }
+
+
+def build_channel_threshold_summary(list_data: ListData, threshold_adc: int) -> pd.DataFrame:
+    records: list[dict[str, Any]] = []
+    total_events = int(list_data.event_t_us.size)
+    for ch in range(64):
+        hg = list_data.channel_hg[ch]
+        lg = list_data.channel_lg[ch]
+        hg_count = int(np.sum(hg >= threshold_adc))
+        lg_count = int(np.sum(lg >= threshold_adc))
+        records.append(
+            {
+                "channel": ch,
+                "threshold_adc": threshold_adc,
+                "hg_count_above_threshold": hg_count,
+                "hg_fraction_above_threshold": (hg_count / total_events) if total_events else math.nan,
+                "lg_count_above_threshold": lg_count,
+                "lg_fraction_above_threshold": (lg_count / total_events) if total_events else math.nan,
+            }
+        )
+
+    df = pd.DataFrame.from_records(records).sort_values("channel").reset_index(drop=True)
+    float_cols = df.select_dtypes(include=["float64", "float32"]).columns
+    df[float_cols] = df[float_cols].round(4)
+    return df
+
+
 def plot_adc_histograms_by_channel(
     channel_data: dict[int, np.ndarray],
     channel_metrics: pd.DataFrame,
     gain_label: str,
     output_path: Path,
     run_labels: dict[str, str],
+    plot_context: dict[str, str],
 ) -> None:
     all_values = np.concatenate([channel_data[ch] for ch in range(64)])
     x_max = float(np.percentile(all_values, 99.8))
     x_max = max(220.0, min(8192.0, x_max))
 
-    fig, axes = plt.subplots(8, 8, figsize=(22, 19), constrained_layout=True, sharex=True, sharey=True)
+    fig, axes = plt.subplots(8, 8, figsize=(24, 22), constrained_layout=True, sharex=True, sharey=True)
     bins = np.linspace(0, x_max, 82)
 
     peak_col = f"mip_peak_{gain_label.lower()}"
@@ -393,22 +431,31 @@ def plot_adc_histograms_by_channel(
         mip = mip_lookup.get(ch, math.nan)
         if not np.isnan(mip):
             ax.axvline(mip, color="#d62728", lw=1.2, alpha=0.95)
-        ax.set_title(f"Ch {ch:02d}", fontsize=9)
-        ax.tick_params(axis="both", labelsize=7)
+        ax.set_title(f"Ch {ch:02d}", fontsize=11)
+        ax.tick_params(axis="both", labelsize=8)
 
     fig.suptitle(
         f"{gain_label.upper()} ADC Distribution by Channel (red = estimated MIP peak)\n"
         f"{run_labels['header']} | {run_labels['utc_window']}",
-        fontsize=15,
+        fontsize=18,
     )
-    fig.supxlabel(f"{gain_label.upper()} ADC", fontsize=12)
-    fig.supylabel("Counts", fontsize=12)
-    fig.text(0.5, 0.005, f"Local time window: {run_labels['local_window']}", ha="center", fontsize=10)
+    fig.supxlabel(f"{gain_label.upper()} ADC", fontsize=14)
+    fig.supylabel("Counts", fontsize=14)
+    fig.text(
+        0.5,
+        0.012,
+        f"TriggerLogic={plot_context['trigger_logic']} | TD={plot_context['td_threshold']} | "
+        f"QD={plot_context['qd_threshold']} | Local: {run_labels['local_window']}",
+        ha="center",
+        fontsize=11,
+    )
     fig.savefig(output_path, dpi=160)
     plt.close(fig)
 
 
-def plot_mip_peaks(channel_metrics: pd.DataFrame, output_path: Path, run_labels: dict[str, str]) -> None:
+def plot_mip_peaks(
+    channel_metrics: pd.DataFrame, output_path: Path, run_labels: dict[str, str], plot_context: dict[str, str]
+) -> None:
     fig, ax = plt.subplots(figsize=(13.5, 6.2))
     ax.plot(
         channel_metrics["channel"],
@@ -450,16 +497,19 @@ def plot_mip_peaks(channel_metrics: pd.DataFrame, output_path: Path, run_labels:
     ax.set_ylabel("ADC", fontsize=12)
     ax.set_title("Derived MIP Peak and Pedestal per Channel", fontsize=14)
     ax.grid(True, alpha=0.28)
-    ax.legend(loc="upper left", fontsize=10, ncol=2, framealpha=0.95)
+    ax.legend(loc="upper right", fontsize=10.5, ncol=2, framealpha=0.95)
     ax.xaxis.set_major_locator(plt.MaxNLocator(integer=True, nbins=16))
     ax.tick_params(labelsize=10)
     ax.text(
-        0.01,
-        0.98,
-        f"{run_labels['header']}\nUTC: {run_labels['utc_window']}\nLocal: {run_labels['local_window']}",
+        0.985,
+        0.04,
+        f"{run_labels['header']}\nUTC: {run_labels['utc_window']}\n"
+        f"TriggerLogic={plot_context['trigger_logic']}, TD={plot_context['td_threshold']}, "
+        f"QD={plot_context['qd_threshold']}",
         transform=ax.transAxes,
-        va="top",
-        fontsize=9.3,
+        ha="right",
+        va="bottom",
+        fontsize=9.4,
         bbox={"boxstyle": "round,pad=0.3", "facecolor": "white", "alpha": 0.88, "edgecolor": "#cccccc"},
     )
     fig.savefig(output_path, dpi=170, bbox_inches="tight")
@@ -473,17 +523,14 @@ def plot_rate_single_axis(
     x_label: str,
     run_labels: dict[str, str],
     zone_label: str,
+    plot_context: dict[str, str],
 ) -> None:
     trig = rate_df["trigger_rate_hz"].to_numpy(dtype=float)
     trig_sigma = rate_df["trigger_rate_sigma_hz"].to_numpy(dtype=float)
-    hit = rate_df["integrated_hit_rate_hz"].to_numpy(dtype=float)
-    hit_sigma = rate_df["integrated_hit_rate_sigma_hz"].to_numpy(dtype=float)
 
-    ax.plot(x_values, trig, color="#1f77b4", lw=2.1, label="Trigger rate [Hz]")
-    ax.plot(x_values, hit, color="#ff7f0e", lw=2.1, label="Integrated channel rate [Hz]")
+    ax.plot(x_values, trig, color="#1f77b4", lw=2.5, label="Trigger rate [Hz]")
 
     ax.fill_between(x_values, trig - trig_sigma, trig + trig_sigma, color="#1f77b4", alpha=0.12)
-    ax.fill_between(x_values, hit - hit_sigma, hit + hit_sigma, color="#ff7f0e", alpha=0.11)
 
     step = max(1, len(rate_df) // 80)
     reduced = rate_df.iloc[::step]
@@ -498,37 +545,34 @@ def plot_rate_single_axis(
         elinewidth=0.9,
         capsize=1.8,
     )
-    ax.errorbar(
-        reduced_x,
-        reduced["integrated_hit_rate_hz"],
-        yerr=reduced["integrated_hit_rate_sigma_hz"],
-        fmt="none",
-        ecolor="#ff7f0e",
-        alpha=0.35,
-        elinewidth=0.9,
-        capsize=1.8,
-    )
 
     ax.set_title(f"Run Rate Time Series ({zone_label})", fontsize=14)
     ax.set_xlabel(x_label, fontsize=11)
     ax.set_ylabel("Rate [Hz]", fontsize=11)
     ax.grid(True, alpha=0.26)
-    ax.legend(loc="upper left", fontsize=10, framealpha=0.95)
+    ax.legend(loc="upper right", fontsize=11, framealpha=0.95)
     configure_datetime_axis(ax)
     ax.text(
-        0.99,
+        0.01,
         0.98,
-        f"{run_labels['header']}\nUTC: {run_labels['utc_window']}",
+        f"{run_labels['header']}\nUTC: {run_labels['utc_window']}\n"
+        f"TriggerLogic={plot_context['trigger_logic']} | "
+        f"TD={plot_context['td_threshold']} | QD={plot_context['qd_threshold']}",
         transform=ax.transAxes,
-        ha="right",
+        ha="left",
         va="top",
-        fontsize=9.2,
+        fontsize=9.4,
         bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "alpha": 0.86, "edgecolor": "#cccccc"},
     )
 
 
 def plot_rate_timeseries(
-    rate_df: pd.DataFrame, output_utc: Path, output_local: Path, run_labels: dict[str, str], tz_name: str
+    rate_df: pd.DataFrame,
+    output_utc: Path,
+    output_local: Path,
+    run_labels: dict[str, str],
+    tz_name: str,
+    plot_context: dict[str, str],
 ) -> None:
     fig1, ax1 = plt.subplots(figsize=(14, 5.8))
     plot_rate_single_axis(
@@ -538,6 +582,7 @@ def plot_rate_timeseries(
         "Time (UTC)",
         run_labels=run_labels,
         zone_label="UTC",
+        plot_context=plot_context,
     )
     fig1.savefig(output_utc, dpi=165, bbox_inches="tight")
     plt.close(fig1)
@@ -550,9 +595,58 @@ def plot_rate_timeseries(
         f"Time ({tz_name})",
         run_labels=run_labels,
         zone_label=tz_name,
+        plot_context=plot_context,
     )
     fig2.savefig(output_local, dpi=165, bbox_inches="tight")
     plt.close(fig2)
+
+
+def plot_channel_threshold_counts(
+    threshold_df: pd.DataFrame,
+    output_path: Path,
+    run_labels: dict[str, str],
+    plot_context: dict[str, str],
+) -> None:
+    fig, ax = plt.subplots(figsize=(14, 6.2))
+    channels = threshold_df["channel"].to_numpy(dtype=float)
+    hg_counts = threshold_df["hg_count_above_threshold"].to_numpy(dtype=float)
+    lg_counts = threshold_df["lg_count_above_threshold"].to_numpy(dtype=float)
+    threshold_adc = int(threshold_df["threshold_adc"].iloc[0])
+
+    ax.plot(channels, hg_counts, marker="o", lw=2.2, ms=4.5, color="#1f77b4", label="HG count")
+    ax.plot(channels, lg_counts, marker="s", lw=2.2, ms=4.2, color="#2ca02c", label="LG count")
+    ax.set_yscale("symlog", linthresh=5)
+    ax.set_xlabel("Channel", fontsize=12)
+    ax.set_ylabel("Events above threshold", fontsize=12)
+    ax.set_title(f"Channel Occupancy Above {threshold_adc} ADC (dead-channel screening)", fontsize=14)
+    ax.grid(True, which="both", alpha=0.24)
+    ax.legend(loc="upper right", fontsize=10.5, framealpha=0.95)
+    ax.xaxis.set_major_locator(plt.MaxNLocator(integer=True, nbins=16))
+    ax.tick_params(labelsize=10)
+
+    dead_hg = int(np.sum(hg_counts == 0))
+    dead_lg = int(np.sum(lg_counts == 0))
+    dead_hg_channels = channels[hg_counts == 0]
+    dead_lg_channels = channels[lg_counts == 0]
+    if dead_hg_channels.size:
+        ax.scatter(dead_hg_channels, np.zeros_like(dead_hg_channels), color="#1f77b4", marker="x", s=30, alpha=0.9)
+    if dead_lg_channels.size:
+        ax.scatter(dead_lg_channels, np.zeros_like(dead_lg_channels), color="#2ca02c", marker="x", s=30, alpha=0.9)
+    ax.text(
+        0.01,
+        0.98,
+        f"{run_labels['header']}\nUTC: {run_labels['utc_window']}\n"
+        f"Threshold={threshold_adc} ADC | TriggerLogic={plot_context['trigger_logic']} | "
+        f"TD={plot_context['td_threshold']} | QD={plot_context['qd_threshold']}\n"
+        f"Channels with zero count: HG={dead_hg}, LG={dead_lg}",
+        transform=ax.transAxes,
+        ha="left",
+        va="top",
+        fontsize=9.4,
+        bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "alpha": 0.86, "edgecolor": "#cccccc"},
+    )
+    fig.savefig(output_path, dpi=170, bbox_inches="tight")
+    plt.close(fig)
 
 
 def plot_service_info(service_df: pd.DataFrame, output_path: Path, run_labels: dict[str, str]) -> None:
@@ -622,6 +716,7 @@ def write_dashboard(
         ("adc_hg_by_channel", "ADC per Channel (HG)"),
         ("adc_lg_by_channel", "ADC per Channel (LG)"),
         ("mip_peak_by_channel_hg_lg", "Derived MIP Peaks (HG + LG)"),
+        ("channel_threshold_counts", "Counts Above ADC Threshold"),
         ("rate_timeseries_utc", "Rate Time Series (UTC)"),
         ("rate_timeseries_los_angeles", "Rate Time Series (America/Los_Angeles)"),
         ("service_monitoring_utc", "Service Monitoring (UTC)"),
@@ -698,6 +793,7 @@ def main() -> None:
     parser.add_argument("--outdir", type=Path, default=Path("outputs"))
     parser.add_argument("--timezone", type=str, default="America/Los_Angeles")
     parser.add_argument("--rate-bin-sec", type=int, default=60)
+    parser.add_argument("--channel-threshold-adc", type=int, default=200)
     args = parser.parse_args()
 
     plt.rcParams.update(
@@ -728,8 +824,10 @@ def main() -> None:
     metadata["list_header_board"] = list_data.board_model
 
     channel_metrics = build_channel_metrics(list_data)
+    threshold_summary_df = build_channel_threshold_summary(list_data, threshold_adc=args.channel_threshold_adc)
     rate_df, run_start_evt, run_stop_evt = build_rate_dataframe(list_data, args.rate_bin_sec, args.timezone)
     run_labels = build_run_time_labels(metadata, run_start_evt, run_stop_evt, args.timezone)
+    plot_context = build_plot_context(metadata, channel_threshold_adc=args.channel_threshold_adc)
 
     generated_plots: dict[str, str] = {}
 
@@ -740,6 +838,7 @@ def main() -> None:
             gain_label="HG",
             output_path=plots_dir / "adc_hg_by_channel.png",
             run_labels=run_labels,
+            plot_context=plot_context,
         )
         generated_plots["adc_hg_by_channel"] = "../plots/adc_hg_by_channel.png"
 
@@ -750,12 +849,27 @@ def main() -> None:
             gain_label="LG",
             output_path=plots_dir / "adc_lg_by_channel.png",
             run_labels=run_labels,
+            plot_context=plot_context,
         )
         generated_plots["adc_lg_by_channel"] = "../plots/adc_lg_by_channel.png"
 
     if "mip_peak_by_channel_hg_lg" in mode_profile["expected_plots"]:
-        plot_mip_peaks(channel_metrics, plots_dir / "mip_peak_by_channel_hg_lg.png", run_labels)
+        plot_mip_peaks(
+            channel_metrics,
+            plots_dir / "mip_peak_by_channel_hg_lg.png",
+            run_labels,
+            plot_context=plot_context,
+        )
         generated_plots["mip_peak_by_channel_hg_lg"] = "../plots/mip_peak_by_channel_hg_lg.png"
+
+    if "channel_threshold_counts" in mode_profile["expected_plots"]:
+        plot_channel_threshold_counts(
+            threshold_df=threshold_summary_df,
+            output_path=plots_dir / "channel_threshold_counts.png",
+            run_labels=run_labels,
+            plot_context=plot_context,
+        )
+        generated_plots["channel_threshold_counts"] = "../plots/channel_threshold_counts.png"
 
     if "rate_timeseries_utc" in mode_profile["expected_plots"] or "rate_timeseries_los_angeles" in mode_profile[
         "expected_plots"
@@ -766,6 +880,7 @@ def main() -> None:
             plots_dir / "rate_timeseries_los_angeles.png",
             run_labels=run_labels,
             tz_name=args.timezone,
+            plot_context=plot_context,
         )
         generated_plots["rate_timeseries_utc"] = "../plots/rate_timeseries_utc.png"
         generated_plots["rate_timeseries_los_angeles"] = "../plots/rate_timeseries_los_angeles.png"
@@ -775,6 +890,7 @@ def main() -> None:
         generated_plots["service_monitoring_utc"] = "../plots/service_monitoring_utc.png"
 
     channel_metrics.to_csv(tables_dir / "channel_metrics.csv", index=False)
+    threshold_summary_df.to_csv(tables_dir / "channel_threshold_summary.csv", index=False)
     rate_df.to_csv(tables_dir / "rate_timeseries.csv", index=False)
     service_df.to_csv(tables_dir / "service_info_parsed.csv", index=False)
 
@@ -790,14 +906,15 @@ def main() -> None:
         "detected_mode": mode_profile["detected_mode"],
         "gain_select": mode_profile["gain_select"],
         "list_file_format_version": list_data.file_format_version,
+        "channel_threshold_adc": int(args.channel_threshold_adc),
+        "trigger_logic": metadata.get("config", {}).get("TriggerLogic", "N/A"),
+        "td_coarse_threshold": metadata.get("config", {}).get("TD_CoarseThreshold", "N/A"),
+        "qd_coarse_threshold": metadata.get("config", {}).get("QD_CoarseThreshold", "N/A"),
         "events": int(list_data.event_t_us.size),
         "channels": 64,
         "total_samples": int(sum(arr.size for arr in list_data.channel_hg.values())),
         "run_duration_s_from_events": round_float(run_duration_s, 3),
         "trigger_rate_hz_avg": round_float(float(list_data.event_t_us.size / run_duration_s), 4)
-        if run_duration_s > 0
-        else math.nan,
-        "integrated_hit_rate_hz_avg": round_float(float(np.sum(list_data.event_nhits) / run_duration_s), 4)
         if run_duration_s > 0
         else math.nan,
         "mip_peak_hg_channels_with_estimate": int(valid_mip_hg.size),
@@ -806,6 +923,8 @@ def main() -> None:
         "mip_peak_lg_channels_with_estimate": int(valid_mip_lg.size),
         "mip_peak_lg_mean_adc": round_float(float(valid_mip_lg.mean()), 3) if valid_mip_lg.size else math.nan,
         "mip_peak_lg_std_adc": round_float(float(valid_mip_lg.std()), 3) if valid_mip_lg.size else math.nan,
+        "channels_with_zero_hg_above_threshold": int(np.sum(threshold_summary_df["hg_count_above_threshold"] == 0)),
+        "channels_with_zero_lg_above_threshold": int(np.sum(threshold_summary_df["lg_count_above_threshold"] == 0)),
         "vmon_mean_v": round_float(float(service_df["Vmon"].mean()), 4),
         "imon_mean_ma": round_float(float(service_df["Imon"].mean()), 5),
         "board_temp_mean_c": round_float(float(service_df["BrdTemp"].mean()), 3),

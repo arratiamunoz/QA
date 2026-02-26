@@ -117,7 +117,8 @@
       "service_monitoring_utc",
       "adc_hg_by_channel",
       "adc_lg_by_channel",
-      "mip_peak_by_channel_hg_lg"
+      "mip_peak_by_channel_hg_lg",
+      "channel_threshold_counts"
     ],
     "warnings": []
   },
