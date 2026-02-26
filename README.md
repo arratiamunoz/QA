@@ -1,0 +1,95 @@
+# QA Analysis for Janus/DT5202 Runs
+
+This repository contains a reproducible QA workflow for Janus ASCII list data with companion run metadata and service-monitoring logs.
+
+The current commit includes `Run7` data and generated outputs:
+
+- `data/raw/Run7_list.txt`
+- `data/raw/Run7_Info.txt`
+- `data/raw/Run7_ServiceInfo.txt`
+
+## What the pipeline produces
+
+- Per-channel ADC distributions (HG) with estimated MIP peak overlays
+- Derived MIP peak position per channel
+- Run-level rate time series in:
+  - UTC
+  - America/Los_Angeles
+- Service-monitoring trends (temperatures, Vmon, Imon)
+- QA tables (`CSV` + `JSON`) and a lightweight HTML dashboard
+
+## Run the analysis
+
+```bash
+python -m pip install -r requirements.txt
+python src/generate_qa_report.py
+```
+
+Optional arguments:
+
+```bash
+python src/generate_qa_report.py ^
+  --list-file data/raw/Run7_list.txt ^
+  --info-file data/raw/Run7_Info.txt ^
+  --service-file data/raw/Run7_ServiceInfo.txt ^
+  --outdir outputs ^
+  --timezone America/Los_Angeles ^
+  --rate-bin-sec 60
+```
+
+## Metadata snapshot (Run7)
+
+From `Run7_Info.txt` and list-file header:
+
+- Run number: `7`
+- Local start/stop (as reported): `19/02/2026 13:40:34` to `19/02/2026 16:59:42`
+- UTC start from list header: `2026-02-19T21:40:34+00:00`
+- Acquisition mode: `SPECTROSCOPY`
+- Trigger logic: `MAJ64` (majority level `2`)
+- Gain select: `BOTH` (`HG_Gain=25`, `LG_Gain=55`)
+- Common pedestal setting: `100`
+- HV bias: `57 V`
+
+## QA summary (generated from Run7)
+
+From `outputs/tables/summary_metrics.json`:
+
+- Events: `22,643`
+- Channels: `64`
+- Samples: `1,449,152` (64 samples/event)
+- Event-span duration: `11,946.30 s`
+- Average trigger rate: `1.895 Hz`
+- Average integrated channel rate: `121.31 Hz`
+- Channels with MIP-peak estimate: `18`
+- Mean estimated MIP peak (across valid channels): `401.42 ADC`
+
+## Plots
+
+### HG ADC per channel (with estimated MIP peak marker)
+
+![HG ADC by channel](outputs/plots/adc_hg_by_channel.png)
+
+### Derived MIP peak position per channel
+
+![MIP peak by channel](outputs/plots/mip_peak_by_channel.png)
+
+### Overall rate time series (UTC)
+
+![Rate UTC](outputs/plots/rate_timeseries_utc.png)
+
+### Overall rate time series (America/Los_Angeles)
+
+![Rate Los Angeles](outputs/plots/rate_timeseries_los_angeles.png)
+
+### Service monitoring (UTC)
+
+![Service monitoring](outputs/plots/service_monitoring_utc.png)
+
+## Dashboard and tables
+
+- Dashboard: `outputs/dashboard/index.html`
+- Channel metrics: `outputs/tables/channel_metrics.csv`
+- Rate series: `outputs/tables/rate_timeseries.csv`
+- Parsed metadata: `outputs/tables/run_metadata.json`
+- Summary metrics: `outputs/tables/summary_metrics.json`
+

@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>QA Dashboard</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 24px; color: #1a1a1a; }
+    h1, h2 { margin-bottom: 0.3rem; }
+    .grid { display: grid; grid-template-columns: 1fr; gap: 20px; }
+    table { border-collapse: collapse; width: 100%; max-width: 900px; }
+    th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+    th { background: #f4f4f4; }
+    img { width: 100%; max-width: 1200px; border: 1px solid #ddd; }
+    .meta { margin-bottom: 20px; }
+  </style>
+</head>
+<body>
+  <h1>Run QA Dashboard</h1>
+  <p class="meta"><strong>Run:</strong> 7 | <strong>UTC start:</strong> 2026-02-19T21:40:34+00:00</p>
+
+  <h2>Summary Metrics</h2>
+  <table>
+    <tbody><tr><td>run_start_event_utc</td><td>2026-02-19T21:40:34.949205864+00:00</td></tr><tr><td>run_stop_event_utc</td><td>2026-02-20T00:59:41.250632968+00:00</td></tr><tr><td>events</td><td>22643</td></tr><tr><td>channels</td><td>64</td></tr><tr><td>total_samples</td><td>1449152</td></tr><tr><td>run_duration_s_from_events</td><td>11946.301427</td></tr><tr><td>trigger_rate_hz_avg</td><td>1.8953983488834665</td></tr><tr><td>integrated_hit_rate_hz_avg</td><td>121.30549432854185</td></tr><tr><td>mip_peak_channels_with_estimate</td><td>18</td></tr><tr><td>mip_peak_hg_mean_adc</td><td>401.4237288687782</td></tr><tr><td>mip_peak_hg_std_adc</td><td>397.5961386929182</td></tr><tr><td>vmon_mean</td><td>56.99996655770681</td></tr><tr><td>imon_mean_ma</td><td>0.0070372977956583704</td></tr><tr><td>board_temp_mean_c</td><td>49.64659290922806</td></tr><tr><td>det_temp_mean_c</td><td>25.32275584611516</td></tr><tr><td>fpga_temp_mean_c</td><td>54.046735395189</td></tr><tr><td>hv_temp_mean_c</td><td>46.04973598189589</td></tr></tbody>
+  </table>
+
+  <h2>Selected Metadata</h2>
+  <table>
+    <tbody><tr><td>AcquisitionMode</td><td>N/A</td></tr><tr><td>TriggerLogic</td><td>N/A</td></tr><tr><td>HG_Gain</td><td>25</td></tr><tr><td>LG_Gain</td><td>55</td></tr><tr><td>Pedestal</td><td>100</td></tr><tr><td>HV_Vbias</td><td>57</td></tr><tr><td>TD_CoarseThreshold</td><td>450</td></tr><tr><td>QD_CoarseThreshold</td><td>250</td></tr></tbody>
+  </table>
+
+  <div class="grid">
+    <section>
+      <h2>ADC per Channel (HG)</h2>
+      <img src="../plots/adc_hg_by_channel.png" alt="ADC by channel">
+    </section>
+    <section>
+      <h2>Derived MIP Peaks</h2>
+      <img src="../plots/mip_peak_by_channel.png" alt="MIP peaks">
+    </section>
+    <section>
+      <h2>Rate Time Series (UTC)</h2>
+      <img src="../plots/rate_timeseries_utc.png" alt="Rate UTC">
+    </section>
+    <section>
+      <h2>Rate Time Series (America/Los_Angeles)</h2>
+      <img src="../plots/rate_timeseries_los_angeles.png" alt="Rate LA">
+    </section>
+    <section>
+      <h2>Service Monitoring</h2>
+      <img src="../plots/service_monitoring_utc.png" alt="Service monitoring">
+    </section>
+  </div>
+</body>
+</html>
