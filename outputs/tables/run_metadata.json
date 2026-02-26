@@ -118,7 +118,8 @@
       "adc_hg_by_channel",
       "adc_lg_by_channel",
       "mip_peak_by_channel_hg_lg",
-      "channel_threshold_counts"
+      "channel_threshold_counts",
+      "hit_multiplicity_timeseries"
     ],
     "warnings": []
   },

@@ -18,6 +18,7 @@ The current commit includes `Run7` data and generated outputs:
   - America/Los_Angeles
   - trigger rate only, with statistical uncertainties (Poisson error bars/bands)
 - Channel threshold-pass summary (`ADC >= 200` by default) to identify possible dead channels
+- Average hit multiplicity per event vs time (hit defined as `ADC >= threshold`)
 - Service-monitoring trends (temperatures, Vmon, Imon)
 - QA tables (`CSV` + `JSON`) and a lightweight HTML dashboard
 
@@ -73,6 +74,7 @@ From `outputs/tables/summary_metrics.json`:
 - Mean estimated MIP peak (HG): `401.424 ADC`
 - Mean estimated MIP peak (LG): `559.876 ADC`
 - Channels with zero counts above 200 ADC: `HG=36`, `LG=46`
+- Average hit multiplicity above 200 ADC: `HG=2.7665`, `LG=2.2128`
 
 ## Plots
 
@@ -92,6 +94,10 @@ From `outputs/tables/summary_metrics.json`:
 
 ![Channel threshold counts](outputs/plots/channel_threshold_counts.png)
 
+### Average hit multiplicity per event vs time (UTC)
+
+![Hit multiplicity vs time](outputs/plots/hit_multiplicity_timeseries_utc.png)
+
 ### Trigger rate time series (UTC, with statistical uncertainty)
 
 ![Rate UTC](outputs/plots/rate_timeseries_utc.png)
@@ -109,6 +115,7 @@ From `outputs/tables/summary_metrics.json`:
 - Dashboard: `outputs/dashboard/index.html`
 - Channel metrics: `outputs/tables/channel_metrics.csv`
 - Channel threshold summary: `outputs/tables/channel_threshold_summary.csv`
+- Hit multiplicity time series: `outputs/tables/hit_multiplicity_timeseries.csv`
 - Rate series: `outputs/tables/rate_timeseries.csv`
 - Parsed metadata: `outputs/tables/run_metadata.json`
 - Summary metrics: `outputs/tables/summary_metrics.json`

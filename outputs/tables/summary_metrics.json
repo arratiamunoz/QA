@@ -24,6 +24,8 @@
   "mip_peak_lg_std_adc": 301.069,
   "channels_with_zero_hg_above_threshold": 36,
   "channels_with_zero_lg_above_threshold": 46,
+  "avg_hit_multiplicity_hg": 2.7665,
+  "avg_hit_multiplicity_lg": 2.2128,
   "vmon_mean_v": 57.0,
   "imon_mean_ma": 0.00704,
   "board_temp_mean_c": 49.647,

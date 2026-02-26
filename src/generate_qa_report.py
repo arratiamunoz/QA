@@ -229,6 +229,7 @@ def detect_mode_and_plot_profile(metadata: dict[str, Any], list_data: ListData) 
             expected_plots.append("adc_lg_by_channel")
         expected_plots.append("mip_peak_by_channel_hg_lg")
         expected_plots.append("channel_threshold_counts")
+        expected_plots.append("hit_multiplicity_timeseries")
     else:
         mode_warnings.append(
             f"Mode {detected_mode} is not yet fully implemented; only generic rate/service plots will be generated."
@@ -403,6 +404,52 @@ def build_channel_threshold_summary(list_data: ListData, threshold_adc: int) -> 
     float_cols = df.select_dtypes(include=["float64", "float32"]).columns
     df[float_cols] = df[float_cols].round(4)
     return df
+
+
+def build_hit_multiplicity_timeseries(
+    list_data: ListData, threshold_adc: int, bin_sec: int, tz_name: str
+) -> pd.DataFrame:
+    # Build event-by-channel matrices (shape: n_events x 64) using per-channel ordered arrays.
+    hg_matrix = np.column_stack([list_data.channel_hg[ch] for ch in range(64)])
+    lg_matrix = np.column_stack([list_data.channel_lg[ch] for ch in range(64)])
+
+    multiplicity_hg = (hg_matrix >= threshold_adc).sum(axis=1).astype(np.int16)
+    multiplicity_lg = (lg_matrix >= threshold_adc).sum(axis=1).astype(np.int16)
+    event_ts = pd.to_datetime(list_data.run_start_utc) + pd.to_timedelta(list_data.event_t_us, unit="us")
+
+    event_df = pd.DataFrame(
+        {
+            "timestamp_utc": event_ts,
+            "multiplicity_hg": multiplicity_hg,
+            "multiplicity_lg": multiplicity_lg,
+            "event_count": np.ones_like(multiplicity_hg, dtype=np.int16),
+        }
+    )
+
+    grouped = (
+        event_df.set_index("timestamp_utc")
+        .resample(f"{bin_sec}s")
+        .agg(
+            events=("event_count", "sum"),
+            multiplicity_hg_mean=("multiplicity_hg", "mean"),
+            multiplicity_hg_std=("multiplicity_hg", "std"),
+            multiplicity_lg_mean=("multiplicity_lg", "mean"),
+            multiplicity_lg_std=("multiplicity_lg", "std"),
+        )
+        .fillna(0.0)
+        .reset_index()
+    )
+
+    events = grouped["events"].to_numpy(dtype=float)
+    safe_events = np.where(events > 0, events, np.nan)
+    grouped["multiplicity_hg_sem"] = grouped["multiplicity_hg_std"] / np.sqrt(safe_events)
+    grouped["multiplicity_lg_sem"] = grouped["multiplicity_lg_std"] / np.sqrt(safe_events)
+    grouped = grouped.fillna(0.0)
+    grouped["timestamp_local"] = grouped["timestamp_utc"].dt.tz_convert(tz_name)
+
+    float_cols = grouped.select_dtypes(include=["float64", "float32"]).columns
+    grouped[float_cols] = grouped[float_cols].round(4)
+    return grouped
 
 
 def plot_adc_histograms_by_channel(
@@ -601,6 +648,71 @@ def plot_rate_timeseries(
     plt.close(fig2)
 
 
+def plot_hit_multiplicity_timeseries(
+    multiplicity_df: pd.DataFrame,
+    output_utc: Path,
+    run_labels: dict[str, str],
+    plot_context: dict[str, str],
+) -> None:
+    fig, ax = plt.subplots(figsize=(14, 5.9))
+    x = multiplicity_df["timestamp_utc"]
+
+    hg_mean = multiplicity_df["multiplicity_hg_mean"].to_numpy(dtype=float)
+    hg_sem = multiplicity_df["multiplicity_hg_sem"].to_numpy(dtype=float)
+    lg_mean = multiplicity_df["multiplicity_lg_mean"].to_numpy(dtype=float)
+    lg_sem = multiplicity_df["multiplicity_lg_sem"].to_numpy(dtype=float)
+
+    ax.plot(x, hg_mean, color="#1f77b4", lw=2.3, label="Avg multiplicity HG")
+    ax.plot(x, lg_mean, color="#2ca02c", lw=2.3, label="Avg multiplicity LG")
+    ax.fill_between(x, hg_mean - hg_sem, hg_mean + hg_sem, color="#1f77b4", alpha=0.12)
+    ax.fill_between(x, lg_mean - lg_sem, lg_mean + lg_sem, color="#2ca02c", alpha=0.12)
+
+    step = max(1, len(multiplicity_df) // 80)
+    reduced = multiplicity_df.iloc[::step]
+    rx = x.iloc[::step]
+    ax.errorbar(
+        rx,
+        reduced["multiplicity_hg_mean"],
+        yerr=reduced["multiplicity_hg_sem"],
+        fmt="none",
+        ecolor="#1f77b4",
+        alpha=0.3,
+        elinewidth=0.9,
+        capsize=1.8,
+    )
+    ax.errorbar(
+        rx,
+        reduced["multiplicity_lg_mean"],
+        yerr=reduced["multiplicity_lg_sem"],
+        fmt="none",
+        ecolor="#2ca02c",
+        alpha=0.3,
+        elinewidth=0.9,
+        capsize=1.8,
+    )
+
+    ax.set_title("Average Hit Multiplicity per Event vs Time (UTC)", fontsize=14)
+    ax.set_xlabel("Time (UTC)", fontsize=11)
+    ax.set_ylabel("Avg hits/event above threshold", fontsize=11)
+    ax.grid(True, alpha=0.26)
+    ax.legend(loc="upper right", fontsize=10.5, framealpha=0.95)
+    configure_datetime_axis(ax)
+    ax.text(
+        0.01,
+        0.98,
+        f"{run_labels['header']}\nUTC: {run_labels['utc_window']}\n"
+        f"Hit threshold={plot_context['channel_threshold_adc']} ADC | "
+        f"TriggerLogic={plot_context['trigger_logic']}",
+        transform=ax.transAxes,
+        ha="left",
+        va="top",
+        fontsize=9.4,
+        bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "alpha": 0.86, "edgecolor": "#cccccc"},
+    )
+    fig.savefig(output_utc, dpi=170, bbox_inches="tight")
+    plt.close(fig)
+
+
 def plot_channel_threshold_counts(
     threshold_df: pd.DataFrame,
     output_path: Path,
@@ -717,6 +829,7 @@ def write_dashboard(
         ("adc_lg_by_channel", "ADC per Channel (LG)"),
         ("mip_peak_by_channel_hg_lg", "Derived MIP Peaks (HG + LG)"),
         ("channel_threshold_counts", "Counts Above ADC Threshold"),
+        ("hit_multiplicity_timeseries", "Average Hit Multiplicity vs Time"),
         ("rate_timeseries_utc", "Rate Time Series (UTC)"),
         ("rate_timeseries_los_angeles", "Rate Time Series (America/Los_Angeles)"),
         ("service_monitoring_utc", "Service Monitoring (UTC)"),
@@ -825,6 +938,12 @@ def main() -> None:
 
     channel_metrics = build_channel_metrics(list_data)
     threshold_summary_df = build_channel_threshold_summary(list_data, threshold_adc=args.channel_threshold_adc)
+    multiplicity_df = build_hit_multiplicity_timeseries(
+        list_data,
+        threshold_adc=args.channel_threshold_adc,
+        bin_sec=args.rate_bin_sec,
+        tz_name=args.timezone,
+    )
     rate_df, run_start_evt, run_stop_evt = build_rate_dataframe(list_data, args.rate_bin_sec, args.timezone)
     run_labels = build_run_time_labels(metadata, run_start_evt, run_stop_evt, args.timezone)
     plot_context = build_plot_context(metadata, channel_threshold_adc=args.channel_threshold_adc)
@@ -871,6 +990,15 @@ def main() -> None:
         )
         generated_plots["channel_threshold_counts"] = "../plots/channel_threshold_counts.png"
 
+    if "hit_multiplicity_timeseries" in mode_profile["expected_plots"]:
+        plot_hit_multiplicity_timeseries(
+            multiplicity_df=multiplicity_df,
+            output_utc=plots_dir / "hit_multiplicity_timeseries_utc.png",
+            run_labels=run_labels,
+            plot_context=plot_context,
+        )
+        generated_plots["hit_multiplicity_timeseries"] = "../plots/hit_multiplicity_timeseries_utc.png"
+
     if "rate_timeseries_utc" in mode_profile["expected_plots"] or "rate_timeseries_los_angeles" in mode_profile[
         "expected_plots"
     ]:
@@ -891,6 +1019,7 @@ def main() -> None:
 
     channel_metrics.to_csv(tables_dir / "channel_metrics.csv", index=False)
     threshold_summary_df.to_csv(tables_dir / "channel_threshold_summary.csv", index=False)
+    multiplicity_df.to_csv(tables_dir / "hit_multiplicity_timeseries.csv", index=False)
     rate_df.to_csv(tables_dir / "rate_timeseries.csv", index=False)
     service_df.to_csv(tables_dir / "service_info_parsed.csv", index=False)
 
@@ -925,6 +1054,8 @@ def main() -> None:
         "mip_peak_lg_std_adc": round_float(float(valid_mip_lg.std()), 3) if valid_mip_lg.size else math.nan,
         "channels_with_zero_hg_above_threshold": int(np.sum(threshold_summary_df["hg_count_above_threshold"] == 0)),
         "channels_with_zero_lg_above_threshold": int(np.sum(threshold_summary_df["lg_count_above_threshold"] == 0)),
+        "avg_hit_multiplicity_hg": round_float(float(multiplicity_df["multiplicity_hg_mean"].mean()), 4),
+        "avg_hit_multiplicity_lg": round_float(float(multiplicity_df["multiplicity_lg_mean"].mean()), 4),
         "vmon_mean_v": round_float(float(service_df["Vmon"].mean()), 4),
         "imon_mean_ma": round_float(float(service_df["Imon"].mean()), 5),
         "board_temp_mean_c": round_float(float(service_df["BrdTemp"].mean()), 3),
